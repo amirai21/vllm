@@ -4,6 +4,8 @@
 import torch
 from torch import nn
 from torch.nn.parameter import Parameter
+from dataclasses import dataclass
+from typing import Optional
 
 from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.distributed.parallel_state import (
@@ -20,7 +22,22 @@ from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
     selective_scan_fn, selective_state_update)
 from vllm.model_executor.models.mamba_cache import MambaCacheParams
 from vllm.model_executor.utils import set_weight_attrs
+from vllm import envs
 
+@dataclass
+class PrefillDecodeInfo:
+    has_prefill: bool
+    has_decode: bool
+    hidden_states_BC_p: Optional[torch.Tensor]
+    hidden_states_BC_d: Optional[torch.Tensor]
+    gate_p: Optional[torch.Tensor]
+    gate_d: Optional[torch.Tensor]
+    state_indices_tensor_p: Optional[torch.Tensor]
+    state_indices_tensor_d: Optional[torch.Tensor]
+    context_lens_tensor_p: Optional[torch.Tensor]
+    context_lens_tensor_d: Optional[torch.Tensor]
+    num_prefills: int
+    num_decodes: int
 
 # Adapted from transformers.models.mamba.modeling_mamba.MambaMixer
 @CustomOp.register("mamba_mixer")
@@ -135,111 +152,173 @@ class MambaMixer(CustomOp):
                        conv_state: torch.Tensor, ssm_state: torch.Tensor):
         pass
 
-    def forward_cuda(self, hidden_states: torch.Tensor,
-                     mamba_cache_params: MambaCacheParams):
 
-        attn_metadata: AttentionMetadata = get_forward_context().attn_metadata
+    def _get_prefill_decode_info(self, attn_metadata, mamba_cache_params, hidden_states_BC, gate) -> PrefillDecodeInfo:
+        """
+        Helper func to determine prefill/decode presence in the batch and extract relevant indices and tensors.
+        Handles batch order: V1 = decode->prefill, V0 = prefill->decode.
+        """
+        num_prefill_tokens = attn_metadata.num_prefill_tokens
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        num_prefills = attn_metadata.num_prefills
+        num_decodes = attn_metadata.num_decode_tokens
+        has_prefill = num_prefill_tokens > 0
+        has_decode = num_decode_tokens > 0
 
-        # 1. Gated MLP's linear projection
-        projected_states = self.in_proj(hidden_states)[0].transpose(-2, -1)
-        hidden_states, gate = projected_states.chunk(2, dim=-2)
-
-        # 2. Convolution sequence transformation
-        conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0),
-                                               self.conv1d.weight.size(2))
-
-        if attn_metadata.query_start_loc is not None \
-            and attn_metadata.context_lens_tensor is not None:
-            # |---------- N-1 iteration --------|
-            # |---------------- N iteration ---------------------|
-            # |- tokenA -|......................|-- newTokens ---|
-            # |---------- context_len ----------|
-            # |-------------------- seq_len ---------------------|
-            #                                   |-- query_len ---|
-            hidden_states = causal_conv1d_fn(
-                hidden_states,
-                conv_weights,
-                bias=self.conv1d.bias,
-                activation=self.activation,
-                conv_states=mamba_cache_params.conv_state,
-                has_initial_state=attn_metadata.context_lens_tensor > 0,
-                cache_indices=mamba_cache_params.state_indices_tensor,
-                query_start_loc=attn_metadata.query_start_loc)
+        if has_prefill and has_decode:
+            def split(tensor, sizes, dim):
+                return torch.split(tensor, sizes, dim=dim) if tensor is not None else (None, None)
+            if envs.VLLM_USE_V1:
+                # V1: decode, prefill order
+                hidden_states_BC_d, hidden_states_BC_p = split(hidden_states_BC, [num_decode_tokens, num_prefill_tokens], -1)
+                gate_d, gate_p = split(gate, [num_decode_tokens, num_prefill_tokens], -1)
+                state_indices_tensor_d, state_indices_tensor_p = split(mamba_cache_params.state_indices_tensor, [num_decodes, num_prefills], 0)
+                context_lens_tensor_d, context_lens_tensor_p = split(attn_metadata.context_lens_tensor, [num_decodes, num_prefills], 0)
+            else:
+                # V0: prefill, decode order
+                hidden_states_BC_p, hidden_states_BC_d = split(hidden_states_BC, [num_prefill_tokens, num_decode_tokens], -1)
+                gate_p, gate_d = split(gate, [num_prefill_tokens, num_decode_tokens], -1)
+                state_indices_tensor_p, state_indices_tensor_d = split(mamba_cache_params.state_indices_tensor, [num_prefills, num_decodes], 0)
+                context_lens_tensor_p, context_lens_tensor_d = split(attn_metadata.context_lens_tensor, [num_prefills, num_decodes], 0)
         else:
-            hidden_states = causal_conv1d_update(
-                hidden_states.transpose(0, 1),
-                mamba_cache_params.conv_state,
-                conv_weights,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=mamba_cache_params.state_indices_tensor)
-            hidden_states = hidden_states.transpose(0, 1)
+            hidden_states_BC_p = hidden_states_BC if has_prefill else None
+            hidden_states_BC_d = hidden_states_BC if has_decode else None
+            gate_p = gate if has_prefill else None
+            gate_d = gate if has_decode else None
+            state_indices_tensor_p = mamba_cache_params.state_indices_tensor if has_prefill else None
+            state_indices_tensor_d = mamba_cache_params.state_indices_tensor if has_decode else None
+            context_lens_tensor_p = attn_metadata.context_lens_tensor if has_prefill else None
+            context_lens_tensor_d = attn_metadata.context_lens_tensor if has_decode else None
 
-        # 3. State Space Model sequence transformation
-        # 3.a. input varying initialization of time_step, B and C
-
-        if self.is_lora_enabled:
-            #   lora kernel requires contiguous tensor
-            ssm_parameters = self.x_proj(
-                hidden_states.transpose(-2, -1).contiguous())[0]
-        else:
-            ssm_parameters = self.x_proj(hidden_states.transpose(-2, -1))[0]
-
-        time_step, B, C = torch.split(
-            ssm_parameters,
-            [self.time_step_rank, self.ssm_state_size, self.ssm_state_size],
-            dim=-1,
+        return PrefillDecodeInfo(
+            has_prefill=has_prefill,
+            has_decode=has_decode,
+            hidden_states_BC_p=hidden_states_BC_p,
+            hidden_states_BC_d=hidden_states_BC_d,
+            gate_p=gate_p,
+            gate_d=gate_d,
+            state_indices_tensor_p=state_indices_tensor_p,
+            state_indices_tensor_d=state_indices_tensor_d,
+            context_lens_tensor_p=context_lens_tensor_p,
+            context_lens_tensor_d=context_lens_tensor_d,
+            num_prefills=num_prefills,
+            num_decodes=num_decodes,
         )
+
+    def _normalize_ssm_params(self, time_step, B, C):
         if self.use_rms_norm:
-            assert self.dt_layernorm is not None
-            assert self.b_layernorm is not None
-            assert self.c_layernorm is not None
             time_step = self.dt_layernorm(time_step.contiguous())
             B = self.b_layernorm(B.contiguous())
             C = self.c_layernorm(C.contiguous())
+        return time_step, B, C
 
-        discrete_time_step = self.dt_proj(time_step)[0].transpose(-2, -1)
-        # 3.c perform the recurrence y ← SSM(A, B, C)(x)
-        time_proj_bias = (self.dt_proj.bias.float() if hasattr(
-            self.dt_proj, "bias") else None)
+    def _run_prefill_flow(self, *, conv_weights, mamba_cache_params, attn_metadata, hidden_states_BC_p, gate_p, state_indices_tensor_p, context_lens_tensor_p, num_prefills):
+        conv_out_p = causal_conv1d_fn(
+            hidden_states_BC_p,
+            conv_weights,
+            self.conv1d.bias,
+            activation=self.activation,
+            conv_states=mamba_cache_params.conv_state,
+            has_initial_state=(context_lens_tensor_p > 0) if context_lens_tensor_p is not None else False,
+            cache_indices=state_indices_tensor_p,
+            query_start_loc=attn_metadata.query_start_loc[:num_prefills + 1] if attn_metadata.query_start_loc is not None else None
+        )
+        conv_out_p = conv_out_p[..., :hidden_states_BC_p.shape[-1]].contiguous()
+        ssm_params_p = self.x_proj(conv_out_p.transpose(-2, -1).contiguous())[0]
+        time_step_p, B_p, C_p = torch.split(ssm_params_p, [self.time_step_rank, self.ssm_state_size, self.ssm_state_size], dim=-1)
+        time_step_p, B_p, C_p = self._normalize_ssm_params(time_step_p, B_p, C_p)
+        discrete_time_step_p = self.dt_proj(time_step_p)[0].transpose(-2, -1)
+        time_proj_bias = self.dt_proj.bias.float() if hasattr(self.dt_proj, "bias") and self.dt_proj.bias is not None else None
+        scan_out_p = selective_scan_fn(
+            conv_out_p,
+            mamba_cache_params.ssm_state,
+            discrete_time_step_p,
+            self.A,
+            B_p.transpose(-2, -1),
+            C_p.transpose(-2, -1),
+            self.D.float(),
+            gate_p,
+            time_proj_bias,
+            delta_softplus=True,
+            cache_indices=state_indices_tensor_p,
+            has_initial_state=(context_lens_tensor_p > 0) if context_lens_tensor_p is not None else False,
+            query_start_loc=attn_metadata.query_start_loc[:num_prefills + 1] if attn_metadata.query_start_loc is not None else None
+        )
+        return scan_out_p
 
-        if attn_metadata.query_start_loc is not None \
-            and attn_metadata.context_lens_tensor is not None:
-            scan_outputs = selective_scan_fn(
-                hidden_states,
-                mamba_cache_params.ssm_state,
-                discrete_time_step,
-                self.A,
-                B.transpose(-2, -1),
-                C.transpose(-2, -1),
-                self.D.float(),
-                gate,
-                time_proj_bias,
-                delta_softplus=True,
-                cache_indices=mamba_cache_params.state_indices_tensor,
-                has_initial_state=attn_metadata.context_lens_tensor > 0,
-                query_start_loc=attn_metadata.query_start_loc)
-        else:
-            scan_outputs = selective_state_update(
-                mamba_cache_params.ssm_state,
-                hidden_states.transpose(0, 1),
-                discrete_time_step.transpose(0, 1),
-                self.A,
-                B,
-                C,
-                self.D,
-                gate.transpose(0, 1),
-                time_proj_bias,
-                dt_softplus=True,
-                state_batch_indices=mamba_cache_params.state_indices_tensor)
-            scan_outputs = scan_outputs.transpose(0, 1)
+    def _run_decode_flow(self, *, conv_weights, mamba_cache_params, hidden_states_BC_d, gate_d, state_indices_tensor_d):
+        conv_out_d = causal_conv1d_update(
+            hidden_states_BC_d.transpose(0, 1),
+            mamba_cache_params.conv_state,
+            conv_weights,
+            self.conv1d.bias,
+            self.activation,
+            conv_state_indices=state_indices_tensor_d
+        )
+        conv_out_d = conv_out_d.transpose(0, 1).contiguous()
+        ssm_params_d = self.x_proj(conv_out_d.transpose(-2, -1).contiguous())[0]
+        time_step_d, B_d, C_d = torch.split(ssm_params_d, [self.time_step_rank, self.ssm_state_size, self.ssm_state_size], dim=-1)
+        time_step_d, B_d, C_d = self._normalize_ssm_params(time_step_d, B_d, C_d)
+        discrete_time_step_d = self.dt_proj(time_step_d)[0].transpose(-2, -1)
+        time_proj_bias = self.dt_proj.bias.float() if hasattr(self.dt_proj, "bias") and self.dt_proj.bias is not None else None
+        scan_out_d = selective_state_update(
+            mamba_cache_params.ssm_state,
+            conv_out_d.transpose(0, 1),
+            discrete_time_step_d.transpose(0, 1),
+            self.A,
+            B_d,
+            C_d,
+            self.D,
+            gate_d.transpose(0, 1),
+            time_proj_bias,
+            dt_softplus=True,
+            state_batch_indices=state_indices_tensor_d
+        )
+        scan_out_d = scan_out_d.transpose(0, 1)
+        return scan_out_d
 
-        # 4. Final linear projection
+    #Optimized for prefill vs decode kernels
+    def forward_cuda(self, hidden_states: torch.Tensor,
+                        mamba_cache_params: MambaCacheParams):
+        attn_metadata = get_forward_context().attn_metadata
+
+        # 1. Gated MLP initial linear projection
+        projected_states = self.in_proj(hidden_states)[0]
+        projected_states = projected_states.transpose(-2, -1)
+        hidden_states_BC, gate = projected_states.chunk(2, dim=-2)
+
+        if self.layer_idx == 5:
+            print(f"has_prefill: {attn_metadata.num_prefill_tokens > 0}, has_decode: {attn_metadata.num_decode_tokens > 0}, num_prefill_tokens: {attn_metadata.num_prefill_tokens}, num_decode_tokens: {attn_metadata.num_decode_tokens}, num_prefills: {attn_metadata.num_prefills}, num_decodes: {attn_metadata.num_decode_tokens}")
+
+        # 2. Get prefill/decode info
+        batch_info = self._get_prefill_decode_info(attn_metadata, mamba_cache_params, hidden_states_BC, gate)
+        conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
+        outputs = []
+        if batch_info.has_prefill:
+            scan_out_p = self._run_prefill_flow(
+                conv_weights=conv_weights,
+                mamba_cache_params=mamba_cache_params,
+                attn_metadata=attn_metadata,
+                hidden_states_BC_p=batch_info.hidden_states_BC_p,
+                gate_p=batch_info.gate_p,
+                state_indices_tensor_p=batch_info.state_indices_tensor_p,
+                context_lens_tensor_p=batch_info.context_lens_tensor_p,
+                num_prefills=batch_info.num_prefills
+            )
+            outputs.append(scan_out_p)
+        if batch_info.has_decode:
+            scan_out_d = self._run_decode_flow(
+                conv_weights=conv_weights,
+                mamba_cache_params=mamba_cache_params,
+                hidden_states_BC_d=batch_info.hidden_states_BC_d,
+                gate_d=batch_info.gate_d,
+                state_indices_tensor_d=batch_info.state_indices_tensor_d
+            )
+            outputs.append(scan_out_d)
+        scan_outputs_combined = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
         if self.is_lora_enabled:
-            #  lora kernel requires contiguous tensor
-            contextualized_states = self.out_proj(
-                scan_outputs.transpose(-2, -1).contiguous())[0]
+            scan_outputs_combined = scan_outputs_combined.transpose(-2, -1).contiguous()
+            out = self.out_proj(scan_outputs_combined)[0]
         else:
-            contextualized_states = self.out_proj(
-                scan_outputs.transpose(-2, -1))[0]
-        return contextualized_states
+            out = self.out_proj(scan_outputs_combined.transpose(-2, -1))[0]
+        return out
