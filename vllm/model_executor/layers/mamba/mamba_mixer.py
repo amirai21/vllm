@@ -287,9 +287,6 @@ class MambaMixer(CustomOp):
         projected_states = projected_states.transpose(-2, -1)
         hidden_states_BC, gate = projected_states.chunk(2, dim=-2)
 
-        if self.layer_idx == 5:
-            print(f"has_prefill: {attn_metadata.num_prefill_tokens > 0}, has_decode: {attn_metadata.num_decode_tokens > 0}, num_prefill_tokens: {attn_metadata.num_prefill_tokens}, num_decode_tokens: {attn_metadata.num_decode_tokens}, num_prefills: {attn_metadata.num_prefills}, num_decodes: {attn_metadata.num_decode_tokens}")
-
         # 2. Get prefill/decode info
         batch_info = self._get_prefill_decode_info(attn_metadata, mamba_cache_params, hidden_states_BC, gate)
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
